@@ -1,0 +1,130 @@
+name: Build Binaries
+
+on:
+  push:
+    # Triggers on push to any tag starting with 'v' (e.g., v1.0.0)
+    tags: ["v*"] 
+  workflow_dispatch:
+
+jobs:
+  ## 🧪 JOB 1: Build binaries for matrix
+  build:
+    name: Build binaries
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            ext: ""
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            /go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          # Ensure the Go binary name matches the downloaded asset name later
+          BIN_NAME="devclean"
+          
+          mkdir -p release
+          out="release/$BIN_NAME-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          echo "Building $out"
+          go build -ldflags="-s -w" -o "$out"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          $BIN_NAME = "devclean"
+          
+          mkdir -p release
+          $out = "release/$BIN_NAME-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          Write-Host "Building $out"
+          go build -ldflags="-s -w" -o $out
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: devclean-${{ matrix.goos }}-${{ matrix.goarch }}
+          # The path must match the output file name
+          path: release/devclean-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+
+  # JOB 2: Create Release and upload assets (UPDATED LOGIC)
+  release:
+    name: Create Release and upload assets
+    needs: build
+    runs-on: ubuntu-latest
+    
+    # CONDITION: Only runs when triggered by a tag push
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    # FIX: Grant write permission for the gh CLI to create the release
+    permissions:
+      contents: write 
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          # Merges all artifacts into the single 'release' directory
+          merge-multiple: true 
+
+      - name: Create GitHub Release and Upload Assets (gh CLI)
+        # FIX: Uses the gh CLI logic for a single, robust step
+        env:
+          # Pass the token as an environment variable for the 'gh' command
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ github.ref_name }}"
+          RELEASE_TITLE="$TAG_NAME"
+          RELEASE_BODY="Automated release for $TAG_NAME"
+          
+          echo "Creating GitHub Release $TAG_NAME..."
+          
+          # 1. Create the release (using the tag that triggered the workflow)
+          gh release create "$TAG_NAME" \
+            --title "$RELEASE_TITLE" \
+            --notes "$RELEASE_BODY" \
+            --draft=false \
+            --prerelease=false \
+            release/*
+          
+          echo "Release $TAG_NAME created successfully with assets."
