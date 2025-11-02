@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io/fs"
 	"os"
@@ -578,15 +579,46 @@ const splashArt = `
 ░░░░░░░░░░    ░░░░░░     ░░░░░      ░░░░░░░░░  ░░░░░  ░░░░░░   ░░░░░░░░ ░░░░ ░░░░░ 
 `
 
+const version = "v0.1.0"
+const helpText = `DevClean: Code Cleanup, Simplified.
+
+Usage:
+  devclean [path]
+
+Flags:
+
+  --version    Show version information
+  --help       Show this help message
+
+If a path is not provided, it will scan the current directory.
+`
+
 func main() {
+	versionFlag := flag.Bool("version", false, "Print version information")
+	helpFlag := flag.Bool("help", false, "Print help information")
+
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println("DevClean", version)
+		os.Exit(0)
+	}
+
+	if *helpFlag {
+		fmt.Println(helpText)
+		os.Exit(0)
+	}
+
 	// Get scan path from command line argument or use current directory
 	scanPath := "."
-	if len(os.Args) > 1 {
-		scanPath = os.Args[1]
+
+	if flag.NArg() > 0 {
+		scanPath = flag.Arg(0)
 	}
 
 	// Convert to absolute path
 	absPath, err := filepath.Abs(scanPath)
+
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
@@ -607,21 +639,26 @@ func main() {
 	)
 
 	s := table.DefaultStyles()
+
 	s.Header = s.Header.
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("240")).
 		BorderBottom(true).
 		Bold(true).
 		Padding(0, 1)
+
 	s.Selected = s.Selected.
 		Foreground(lipgloss.Color("229")).
 		Background(lipgloss.Color("57")).
 		Bold(false)
+
 	s.Cell = s.Cell.Padding(0, 1)
+
 	t.SetStyles(s)
 
 	// Initialize progress bar
 	prog := progress.New(progress.WithDefaultGradient())
+
 	prog.Width = 50
 
 	m := model{
