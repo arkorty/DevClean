@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
-	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -26,20 +25,28 @@ const (
 )
 
 func (s SafetyLevel) String() string {
-	safeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
-	moderateStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true)
-	riskyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
-	unknownStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
-
 	switch s {
 	case Safe:
-		return safeStyle.Render("SAFE")
+		return "SAFE"
 	case Moderate:
-		return moderateStyle.Render("MODERATE")
+		return "MODERATE"
 	case Risky:
-		return riskyStyle.Render("RISKY")
+		return "RISKY"
 	default:
-		return unknownStyle.Render("UNKNOWN")
+		return "UNKNOWN"
+	}
+}
+
+func (s SafetyLevel) Color() lipgloss.Color {
+	switch s {
+	case Safe:
+		return lipgloss.Color("2")
+	case Moderate:
+		return lipgloss.Color("3")
+	case Risky:
+		return lipgloss.Color("1")
+	default:
+		return lipgloss.Color("8")
 	}
 }
 
@@ -48,7 +55,6 @@ type DevDirectory struct {
 	Path        string
 	Description string
 	Safety      SafetyLevel
-	Selected    bool
 	Size        int64
 }
 
@@ -99,19 +105,20 @@ var commonDevDirs = map[string]DevDirectory{
 }
 
 type model struct {
-	table            table.Model
 	directories      []DevDirectory
+	cursor           int
+	selected         map[int]bool
 	scanning         bool
 	scanPath         string
 	progress         progress.Model
 	scanProgress     float64
-	totalDirs        int
 	scannedDirs      int
 	showConfirmation bool
 	pendingAction    string // "delete" or "deleteAll"
 	width            int
 	height           int
 	showSplash       bool
+	viewportStart    int
 }
 
 func (m model) Init() tea.Cmd {
@@ -127,49 +134,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.table.SetWidth(msg.Width - 16)
-		tableHeight := msg.Height - 18
-		if tableHeight < 8 {
-			tableHeight = 8
-		}
-		m.table.SetHeight(tableHeight)
 
-		// Update table columns with responsive widths
-		availableWidth := msg.Width - 16
-		if availableWidth < 80 {
-			availableWidth = 80
-		}
-
-		pathWidth := int(float64(availableWidth) * 0.45)
-		descWidth := int(float64(availableWidth) * 0.25)
-		if pathWidth < 30 {
-			pathWidth = 30
-		}
-		if descWidth < 15 {
-			descWidth = 15
-		}
-
-		columns := []table.Column{
-			{Title: "Select", Width: 8},
-			{Title: "Path", Width: pathWidth},
-			{Title: "Description", Width: descWidth},
-			{Title: "Safety", Width: 18},
-			{Title: "Size", Width: 12},
-		}
-		m.table.SetColumns(columns)
 	case tea.KeyMsg:
 		if m.showConfirmation {
 			switch msg.String() {
 			case "y", "Y":
-				// Confirm deletion
 				m.showConfirmation = false
-				if m.pendingAction == "delete" {
-					return m, deleteSelected(m.directories)
-				} else if m.pendingAction == "deleteAll" {
-					return m, deleteSelected(m.directories)
+				if m.pendingAction == "delete" || m.pendingAction == "deleteAll" {
+					return m, deleteSelected(m.directories, m.selected)
 				}
 			case "n", "N", "esc":
-				// Cancel deletion
 				m.showConfirmation = false
 				m.pendingAction = ""
 			}
@@ -179,198 +153,353 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "q", "ctrl+c":
 			return m, tea.Quit
-		case "enter", " ":
-			// Toggle selection
-			if m.table.Cursor() < len(m.directories) {
-				m.directories[m.table.Cursor()].Selected = !m.directories[m.table.Cursor()].Selected
-				m.updateTableRows()
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+				m.adjustViewport()
 			}
+		case "down", "j":
+			if m.cursor < len(m.directories)-1 {
+				m.cursor++
+				m.adjustViewport()
+			}
+		case "enter", " ":
+			if m.cursor < len(m.directories) {
+				m.selected[m.cursor] = !m.selected[m.cursor]
+				// Move cursor down after selecting
+				if m.cursor < len(m.directories)-1 {
+					m.cursor++
+					m.adjustViewport()
+				}
+			}
+			return m, nil
 		case "d":
-			// Show confirmation for delete selected directories
 			m.showConfirmation = true
 			m.pendingAction = "delete"
 		case "D":
-			// Select all SAFE directories and show confirmation
 			for i := range m.directories {
 				if m.directories[i].Safety == Safe {
-					m.directories[i].Selected = true
+					m.selected[i] = true
 				}
 			}
-			m.updateTableRows()
 			m.showConfirmation = true
 			m.pendingAction = "deleteAll"
 		case "r":
-			// Refresh scan
 			m.scanning = true
 			return m, scanDirectories(m.scanPath)
 		}
+
 	case scanCompleteMsg:
 		m.directories = msg.directories
-		// Sort directories by safety level: SAFE, MODERATE, RISKY
 		sort.Slice(m.directories, func(i, j int) bool {
 			return m.directories[i].Safety < m.directories[j].Safety
 		})
 		m.scanning = false
 		m.scanProgress = 1.0
 		m.showSplash = false
-		m.updateTableRows()
+
 	case scanProgressMsg:
 		m.scanProgress = msg.progress
 		m.scannedDirs = msg.scannedDirs
-		m.totalDirs = msg.totalDirs
+
 	case progressTickMsg:
 		if m.scanning && m.scanProgress < 1.0 {
-			// Simulate progress increment
-			m.scanProgress += 0.02 // Increment by 2% each tick
+			m.scanProgress += 0.02
 			if m.scanProgress > 1.0 {
 				m.scanProgress = 1.0
 			}
-			m.scannedDirs += 50 // Simulate scanning directories
+			m.scannedDirs += 50
 			return m, tickProgress()
 		}
+
 	case deleteCompleteMsg:
-		// Refresh after deletion
 		m.scanning = true
+		m.selected = make(map[int]bool)
+		m.cursor = 0
 		return m, scanDirectories(m.scanPath)
 	}
 
-	m.table, cmd = m.table.Update(msg)
 	return m, cmd
 }
 
-func (m *model) updateTableRows() {
-	rows := make([]table.Row, len(m.directories))
-	checkboxStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
-	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
-
-	// Calculate responsive column widths based on terminal size
-	availableWidth := m.width - 12 // Account for outer container padding + borders + margin + extra space
-	if availableWidth < 80 {
-		availableWidth = 80 // Minimum width
+func (m *model) adjustViewport() {
+	visibleRows := m.height - 18 // Match the visible rows calculation in renderMain
+	if visibleRows < 3 {
+		visibleRows = 3
 	}
 
-	// Distribute widths proportionally
-	pathWidth := int(float64(availableWidth) * 0.45) // 45% for path
-	descWidth := int(float64(availableWidth) * 0.25) // 25% for description
-
-	// Ensure minimum widths
-	if pathWidth < 30 {
-		pathWidth = 30
+	if m.cursor < m.viewportStart {
+		m.viewportStart = m.cursor
+	} else if m.cursor >= m.viewportStart+visibleRows {
+		m.viewportStart = m.cursor - visibleRows + 1
 	}
-	if descWidth < 15 {
-		descWidth = 15
-	}
-
-	for i, dir := range m.directories {
-		checkbox := checkboxStyle.Render("[ ]")
-		if dir.Selected {
-			checkbox = selectedStyle.Render("[X]")
-		}
-
-		// Convert to tilde path and truncate if too long
-		path := convertToTildePath(dir.Path)
-		if len(path) > pathWidth-3 {
-			path = "..." + path[len(path)-(pathWidth-6):]
-		}
-
-		// Truncate description if too long
-		description := dir.Description
-		if len(description) > descWidth-3 {
-			description = description[:descWidth-6] + "..."
-		}
-
-		sizeStr := formatSize(dir.Size)
-
-		rows[i] = table.Row{
-			checkbox,
-			path,
-			description,
-			dir.Safety.String(),
-			sizeStr,
-		}
-	}
-	m.table.SetRows(rows)
 }
 
 func (m model) View() string {
-	scanningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+	if m.showSplash {
+		return m.renderSplash()
+	}
 
-	// Create outer container style
-	outerContainerStyle := lipgloss.NewStyle().
+	if m.scanning {
+		return m.renderScanning()
+	}
+
+	if m.showConfirmation {
+		return m.renderConfirmation()
+	}
+
+	return m.renderMain()
+}
+
+func (m model) renderSplash() string {
+	artStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("45")).
+		Bold(true)
+
+	scanningStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("6")).
+		Bold(true)
+
+	progressView := m.progress.ViewAs(m.scanProgress)
+	statusText := fmt.Sprintf("Scanning %s", m.scanPath)
+
+	content := artStyle.Render(splashArt) + "\n" + scanningStyle.Render(statusText) + "\n\n" + progressView
+
+	outerStyle := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("240")).
 		Padding(1).
 		Margin(1)
 
-	if m.showSplash {
-		artStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("45")).
-			Bold(true)
-
-		progressView := m.progress.ViewAs(m.scanProgress)
-		statusText := fmt.Sprintf("Scanning %s", m.scanPath)
-
-		content := artStyle.Render(splashArt) + "\n" + scanningStyle.Render(statusText) + "\n\n" + progressView
-		return outerContainerStyle.Render(content)
-	}
-
-	if m.scanning {
-		progressView := m.progress.ViewAs(m.scanProgress)
-		statusText := fmt.Sprintf("SCANNING %s\nDirectories scanned: %d", m.scanPath, m.scannedDirs)
-		content := scanningStyle.Render(statusText) + "\n\n" + progressView + "\n\nPress 'q' to quit"
-		return outerContainerStyle.Render(content)
-	}
-
-	help := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("241")).
-		Render("\n\nControls:\n• Space/Enter: Toggle selection\n• 'd': Delete selected\n• 'D': Delete all SAFE directories\n• 'r': Refresh scan\n• 'q': Quit")
-
-	totalSelected := 0
-	totalSize := int64(0)
-	for _, dir := range m.directories {
-		if dir.Selected {
-			totalSelected++
-			totalSize += dir.Size
-		}
-	}
-
-	status := fmt.Sprintf("\nSelected: %d directories (%s)", totalSelected, formatSize(totalSize))
-	mainContent := m.table.View() + status + help
-	mainView := outerContainerStyle.Render(mainContent)
-
-	// If showing confirmation dialog, overlay it in the center
-	if m.showConfirmation {
-		// Use actual terminal dimensions for the overlay
-		containerWidth := m.width
-		containerHeight := m.height
-		if containerWidth == 0 {
-			containerWidth = 80
-		}
-		if containerHeight == 0 {
-			containerHeight = 24
-		}
-		return m.renderConfirmationDialog(mainView, totalSelected, totalSize, containerWidth, containerHeight)
-	}
-
-	return mainView
+	return outerStyle.Render(content)
 }
 
-func (m model) renderConfirmationDialog(mainView string, totalSelected int, totalSize int64, containerWidth, containerHeight int) string {
-	// Calculate responsive dialog width (max 60 chars, but adjust for smaller terminals)
-	dialogWidth := 60
-	if containerWidth < 70 {
-		dialogWidth = containerWidth - 10 // Leave some margin
+func (m model) renderScanning() string {
+	scanningStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("6")).
+		Bold(true)
+
+	progressView := m.progress.ViewAs(m.scanProgress)
+	statusText := fmt.Sprintf("SCANNING %s\nDirectories scanned: %d", m.scanPath, m.scannedDirs)
+
+	content := scanningStyle.Render(statusText) + "\n\n" + progressView + "\n\nPress 'q' to quit"
+
+	outerStyle := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1).
+		Margin(1)
+
+	return outerStyle.Render(content)
+}
+
+func (m model) renderMain() string {
+	var b strings.Builder
+
+	// Calculate available width
+	contentWidth := m.width - 6 // Account for border and padding
+	if contentWidth < 80 {
+		contentWidth = 80
 	}
 
-	// Red confirmation dialog styles
+	// Header
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("15"))
+
+	// Column widths
+	selectWidth := 8
+	pathWidth := int(float64(contentWidth-selectWidth-12-12) * 0.65) // 65% of remaining (more for paths)
+	descWidth := int(float64(contentWidth-selectWidth-12-12) * 0.15) // 15% of remaining (much narrower)
+	safetyWidth := 12
+	sizeWidth := 12
+
+	header := fmt.Sprintf("%-*s %-*s %-*s %-*s %-*s",
+		selectWidth, "Select",
+		pathWidth, "Path",
+		descWidth, "Description",
+		safetyWidth, "Safety",
+		sizeWidth, "Size")
+	b.WriteString(headerStyle.Render(header))
+	b.WriteString("\n")
+
+	// Calculate visible rows based on available space
+	// Account for: border (2), padding (2), header (1), blank line (1), status (2), blank line (1), controls (9)
+	// Total overhead: ~18 lines
+	visibleRows := m.height - 18
+	if visibleRows < 3 {
+		visibleRows = 3
+	}
+
+	end := m.viewportStart + visibleRows
+	if end > len(m.directories) {
+		end = len(m.directories)
+	}
+
+	// Rows
+	for i := m.viewportStart; i < end; i++ {
+		b.WriteString(m.renderRow(i, selectWidth, pathWidth, descWidth, safetyWidth, sizeWidth, contentWidth))
+		b.WriteString("\n")
+	}
+
+	// Fill remaining space with empty lines to maintain consistent height
+	rowsDisplayed := end - m.viewportStart
+	if rowsDisplayed < visibleRows {
+		for i := rowsDisplayed; i < visibleRows; i++ {
+			b.WriteString(strings.Repeat(" ", contentWidth))
+			b.WriteString("\n")
+		}
+	}
+
+	// Status
+	totalSelected := 0
+	totalSize := int64(0)
+	for idx := range m.directories {
+		if m.selected[idx] {
+			totalSelected++
+			totalSize += m.directories[idx].Size
+		}
+	}
+
+	statusStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241"))
+
+	b.WriteString("\n")
+	b.WriteString(statusStyle.Render(fmt.Sprintf("Selected: %d directories (%s)", totalSelected, formatSize(totalSize))))
+	b.WriteString("\n\n")
+
+	// Help - use multiple lines
+	b.WriteString(statusStyle.Render("Controls:"))
+	b.WriteString("\n")
+	b.WriteString(statusStyle.Render("\tk or up arrow: go up"))
+	b.WriteString("\n")
+	b.WriteString(statusStyle.Render("\tj or down arrow: go down"))
+	b.WriteString("\n")
+	b.WriteString(statusStyle.Render("\tspace/enter: toggle selection"))
+	b.WriteString("\n")
+	b.WriteString(statusStyle.Render("\td: delete selected"))
+	b.WriteString("\n")
+	b.WriteString(statusStyle.Render("\tD: auto-delete SAFE tagged folders"))
+	b.WriteString("\n")
+	b.WriteString(statusStyle.Render("\tr: refresh scan"))
+	b.WriteString("\n")
+	b.WriteString(statusStyle.Render("\tq: quit"))
+
+	outerStyle := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1).
+		Width(m.width - 2)
+
+	return outerStyle.Render(b.String())
+}
+
+func (m model) renderRow(idx, selectWidth, pathWidth, descWidth, safetyWidth, sizeWidth, totalWidth int) string {
+	dir := m.directories[idx]
+
+	checkbox := "[ ]"
+	if m.selected[idx] {
+		checkbox = "[X]"
+	}
+
+	path := convertToTildePath(dir.Path)
+
+	// Extract the matched pattern (last directory component)
+	matchedPattern := filepath.Base(dir.Path)
+
+	// Truncate path if needed
+	if len(path) > pathWidth {
+		path = "..." + path[len(path)-(pathWidth-3):]
+	}
+
+	desc := dir.Description
+	if len(desc) > descWidth {
+		desc = desc[:descWidth-3] + "..."
+	}
+
+	safetyText := dir.Safety.String()
+	size := formatSize(dir.Size)
+
+	// Build row with plain text and proper spacing
+	row := fmt.Sprintf("%-*s %-*s %-*s %-*s %-*s",
+		selectWidth, checkbox,
+		pathWidth, path,
+		descWidth, desc,
+		safetyWidth, safetyText,
+		sizeWidth, size)
+
+	// Pad to full width
+	if len(row) < totalWidth {
+		row = row + strings.Repeat(" ", totalWidth-len(row))
+	}
+
+	if idx == m.cursor {
+		cursorStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("229")).
+			Background(lipgloss.Color("57"))
+		return cursorStyle.Render(row)
+	}
+
+	// For non-cursor rows, apply color to safety column and highlight matched pattern in red
+	safetyStyle := lipgloss.NewStyle().
+		Foreground(dir.Safety.Color()).
+		Bold(true)
+
+	redStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("196")).
+		Bold(true)
+
+	// Highlight the matched pattern in the path
+	pathWithHighlight := path
+	if strings.Contains(path, matchedPattern) {
+		// Find the last occurrence of the pattern in the displayed path
+		idx := strings.LastIndex(path, matchedPattern)
+		if idx != -1 {
+			before := path[:idx]
+			pattern := path[idx : idx+len(matchedPattern)]
+			after := path[idx+len(matchedPattern):]
+			pathWithHighlight = before + redStyle.Render(pattern) + after
+		}
+	}
+
+	// Build the row manually with styled safety and highlighted path
+	prefix := fmt.Sprintf("%-*s ", selectWidth, checkbox)
+
+	// Calculate spacing for path - we need to account for the actual display width
+	pathSpacing := strings.Repeat(" ", pathWidth-len(path))
+
+	styledSafety := safetyStyle.Render(fmt.Sprintf("%-*s", safetyWidth, safetyText))
+
+	suffix := fmt.Sprintf(" %-*s", sizeWidth, size)
+
+	// Calculate padding based on plain text length (without ANSI codes)
+	plainRowLen := selectWidth + 1 + pathWidth + 1 + descWidth + 1 + safetyWidth + 1 + sizeWidth
+	padding := ""
+	if totalWidth > plainRowLen {
+		padding = strings.Repeat(" ", totalWidth-plainRowLen)
+	}
+
+	return prefix + pathWithHighlight + pathSpacing + " " + fmt.Sprintf("%-*s ", descWidth, desc) + styledSafety + suffix + padding
+}
+
+func (m model) renderConfirmation() string {
+	totalSelected := 0
+	totalSize := int64(0)
+	for idx := range m.directories {
+		if m.selected[idx] {
+			totalSelected++
+			totalSize += m.directories[idx].Size
+		}
+	}
+
 	dangerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("196")). // Bright red
-		Background(lipgloss.Color("52")).        // Dark red background
-		Foreground(lipgloss.Color("255")).       // White text
+		BorderForeground(lipgloss.Color("196")).
+		Background(lipgloss.Color("52")).
+		Foreground(lipgloss.Color("255")).
 		Bold(true).
 		Padding(1, 2).
-		Width(dialogWidth).
+		Width(60).
 		Align(lipgloss.Center)
 
 	warningStyle := lipgloss.NewStyle().
@@ -380,8 +509,8 @@ func (m model) renderConfirmationDialog(mainView string, totalSelected int, tota
 	var message string
 	if m.pendingAction == "deleteAll" {
 		safeCount := 0
-		for _, dir := range m.directories {
-			if dir.Selected && dir.Safety == Safe {
+		for idx := range m.directories {
+			if m.selected[idx] && m.directories[idx].Safety == Safe {
 				safeCount++
 			}
 		}
@@ -404,8 +533,16 @@ func (m model) renderConfirmationDialog(mainView string, totalSelected int, tota
 
 	confirmDialog := dangerStyle.Render(message)
 
-	// Use lipgloss.Place to center the dialog using actual container dimensions
-	return lipgloss.Place(containerWidth, containerHeight, lipgloss.Center, lipgloss.Center, confirmDialog, lipgloss.WithWhitespaceForeground(lipgloss.Color("240")))
+	width := m.width
+	height := m.height
+	if width == 0 {
+		width = 80
+	}
+	if height == 0 {
+		height = 24
+	}
+
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, confirmDialog, lipgloss.WithWhitespaceForeground(lipgloss.Color("240")))
 }
 
 type scanCompleteMsg struct {
@@ -415,7 +552,6 @@ type scanCompleteMsg struct {
 type scanProgressMsg struct {
 	progress    float64
 	scannedDirs int
-	totalDirs   int
 }
 
 type progressTickMsg struct{}
@@ -432,36 +568,26 @@ func scanDirectories(rootPath string) tea.Cmd {
 	return func() tea.Msg {
 		var foundDirs []DevDirectory
 
-		// Resolve the root path if it's a symlink
 		resolvedRoot, err := filepath.EvalSymlinks(rootPath)
 		if err != nil {
-			// If we can't resolve symlinks, try the original path
 			resolvedRoot = rootPath
 		}
 
-		var scannedDirs int
-
 		err = filepath.Walk(resolvedRoot, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				return nil // Skip errors, continue scanning
+				return nil
 			}
 
-			// Handle symlinks by resolving them
 			if info.Mode()&os.ModeSymlink != 0 {
 				realPath, err := filepath.EvalSymlinks(path)
 				if err != nil {
-					return nil // Skip broken symlinks
+					return nil
 				}
-				// Get info for the real path
 				realInfo, err := os.Stat(realPath)
 				if err != nil {
-					return nil // Skip if we can't stat the real path
+					return nil
 				}
 				info = realInfo
-			}
-
-			if info.IsDir() {
-				scannedDirs++
 			}
 
 			if !info.IsDir() {
@@ -470,25 +596,21 @@ func scanDirectories(rootPath string) tea.Cmd {
 
 			dirName := filepath.Base(path)
 
-			// Check if this directory matches our common dev directories
 			if template, exists := commonDevDirs[dirName]; exists {
 				size := calculateDirSize(path)
 				foundDir := DevDirectory{
 					Path:        path,
 					Description: template.Description,
 					Safety:      template.Safety,
-					Selected:    false,
 					Size:        size,
 				}
 				foundDirs = append(foundDirs, foundDir)
 			}
 
-			// Continue scanning all directories recursively
 			return nil
 		})
 
 		if err != nil {
-			// Return empty result on error
 			return scanCompleteMsg{directories: []DevDirectory{}}
 		}
 
@@ -496,10 +618,10 @@ func scanDirectories(rootPath string) tea.Cmd {
 	}
 }
 
-func deleteSelected(directories []DevDirectory) tea.Cmd {
+func deleteSelected(directories []DevDirectory, selected map[int]bool) tea.Cmd {
 	return func() tea.Msg {
-		for _, dir := range directories {
-			if dir.Selected {
+		for idx, dir := range directories {
+			if selected[idx] {
 				os.RemoveAll(dir.Path)
 			}
 		}
@@ -510,7 +632,6 @@ func deleteSelected(directories []DevDirectory) tea.Cmd {
 func calculateDirSize(path string) int64 {
 	var size int64
 
-	// Use a timeout to avoid hanging on large directories
 	done := make(chan bool, 1)
 	go func() {
 		filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
@@ -531,7 +652,7 @@ func calculateDirSize(path string) int64 {
 	case <-done:
 		return size
 	case <-time.After(2 * time.Second):
-		return -1 // Indicate calculation timed out
+		return -1
 	}
 }
 
@@ -554,11 +675,10 @@ func formatSize(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// convertToTildePath converts absolute paths to use ~ notation for home directory
 func convertToTildePath(absPath string) string {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return absPath // Return original path if we can't get home dir
+		return absPath
 	}
 
 	if strings.HasPrefix(absPath, homeDir) {
@@ -579,7 +699,7 @@ const splashArt = `
 ░░░░░░░░░░    ░░░░░░     ░░░░░      ░░░░░░░░░  ░░░░░  ░░░░░░   ░░░░░░░░ ░░░░ ░░░░░ 
 `
 
-const version = "v0.1.0"
+const version = "v0.1.1"
 const helpText = `DevClean: Code Cleanup, Simplified.
 
 Usage:
@@ -609,72 +729,37 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Get scan path from command line argument or use current directory
 	scanPath := "."
-
 	if flag.NArg() > 0 {
 		scanPath = flag.Arg(0)
 	}
 
-	// Convert to absolute path
 	absPath, err := filepath.Abs(scanPath)
-
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	columns := []table.Column{
-		{Title: "Select", Width: 8},
-		{Title: "Path", Width: 55},
-		{Title: "Description", Width: 30},
-		{Title: "Safety", Width: 18},
-		{Title: "Size", Width: 12},
-	}
-
-	t := table.New(
-		table.WithColumns(columns),
-		table.WithFocused(true),
-		table.WithHeight(20),
-	)
-
-	s := table.DefaultStyles()
-
-	s.Header = s.Header.
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("240")).
-		BorderBottom(true).
-		Bold(true).
-		Padding(0, 1)
-
-	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("229")).
-		Background(lipgloss.Color("57")).
-		Bold(false)
-
-	s.Cell = s.Cell.Padding(0, 1)
-
-	t.SetStyles(s)
-
-	// Initialize progress bar
 	prog := progress.New(progress.WithDefaultGradient())
-
 	prog.Width = 50
 
 	m := model{
-		table:            t,
+		directories:      []DevDirectory{},
+		cursor:           0,
+		selected:         make(map[int]bool),
 		scanning:         true,
 		scanPath:         absPath,
 		progress:         prog,
 		scanProgress:     0.0,
 		showConfirmation: false,
 		pendingAction:    "",
-		width:            80, // Default width
-		height:           24, // Default height
+		width:            80,
+		height:           24,
 		showSplash:       true,
+		viewportStart:    0,
 	}
 
-	if _, err := tea.NewProgram(m).Run(); err != nil {
+	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Printf("Error running program: %v", err)
 		os.Exit(1)
 	}
